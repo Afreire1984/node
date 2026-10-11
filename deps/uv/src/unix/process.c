@@ -36,6 +36,9 @@
 #include <spawn.h>
 #include <paths.h>
 #include <dlfcn.h>
+#if defined(__GLIBC__)
+#include <gnu/libc-version.h>
+#endif
 
 #if defined(__PASE__)
 #define _PATH_DEFPATH "/QOpenSys/pkgs/bin:/QOpenSys/usr/bin:/usr/bin"
@@ -86,6 +89,7 @@ extern char **environ;
 
 static uv_once_t posix_spawn_init_once = UV_ONCE_INIT;
 static int posix_spawn_can_use_setsid;
+static int posix_spawn_dup2_clears_cloexec = 1;
 static volatile int posix_spawn_works;
 
 static struct uv__posix_spawn_fncs_s {
@@ -520,6 +524,19 @@ static void uv__spawn_init_posix_spawn(void) {
     posix_spawn_fncs.file_actions.addchdir =
       dlsym(RTLD_DEFAULT, "posix_spawn_file_actions_addchdir_np");
 
+#if defined(__GLIBC__)
+  /* posix_spawn_file_actions_adddup2(fd, fd) only clears FD_CLOEXEC since
+   * glibc 2.29 (BZ #23640); with older versions, inheriting a close-on-exec fd
+   * at the same number would close it in the child, so use fork() instead. */
+  {
+    unsigned major;
+    unsigned minor;
+    if (sscanf(gnu_get_libc_version(), "%u.%u", &major, &minor) != 2 ||
+        major < 2 || (major == 2 && minor < 29))
+      posix_spawn_dup2_clears_cloexec = 0;
+  }
+#endif
+
 #ifdef __APPLE__
   /* Init feature detection for POSIX_SPAWN_SETSID flag. */
   uv__spawn_init_can_use_setsid();
@@ -632,6 +649,17 @@ static int uv__spawn_set_posix_spawn_file_actions(
     if (err != 0)
       goto error;
   }
+
+#if defined(__linux__)
+  if (!posix_spawn_dup2_clears_cloexec) {
+    for (fd = 0; fd < stdio_count; fd++) {
+      if (pipes[fd][1] == fd) {
+        err = ENOSYS;
+        goto error;
+      }
+    }
+  }
+#endif
 
   /* Do not return ENOSYS after this point, as we may mutate pipes. */
 
